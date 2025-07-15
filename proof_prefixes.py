@@ -9,7 +9,7 @@ base_file = "hard_140_QF_UNIA.smt2"
 # base_file = "toy.smt2"
 
 # num variables, d, to use in static partition, generates 2^d cubes
-partition_depth = 8
+partition_depth = 3
 
 # clause collection globals
 rounds = 0
@@ -17,7 +17,6 @@ cutoff = 1000
 num_samples = 32
 
 def collect_proof_prefix_stats(file_name, assumptions=[]):
-    # ctx = Context()
     s = SimpleSolver()
     s.set(relevancy=0)
     s.set("smt.case_split", 0)
@@ -114,13 +113,35 @@ def build_static_partition(starting_cube, cube_size=partition_depth):
  
     return result
 
-def solve_cube(cube):
+def solve_cube_parallel(params):
+    cube, ctx = params
+    for cube_lit in cube:
+        assert cube_lit.ctx == ctx
+        assert cube_lit.ctx != main_ctx()
+
+    s = SimpleSolver(ctx)
+    s.from_file(base_file)
+    s.add(*cube)
+    
+    timeout_secs = 10
+    s.set("timeout", timeout_secs * 1000)  # Z3 timeout in milliseconds
+    set_param("verbose", 0)
+    
+    res = s.check()
+    if res == unknown:
+        print("⚠️ Timeout or resource limit hit:", s.reason_unknown())
+    else:
+        print("✅ Result:", res)
+
+def solve_cube_synchronous(cube):
     s = SimpleSolver()
     s.from_file(base_file)
     s.add(*cube)
+    
     timeout_secs = 10
     s.set("timeout", timeout_secs * 1000)  # Z3 timeout in milliseconds
-    # set_param("verbose", 10)
+    set_param("verbose", 0)
+    
     res = s.check()
     if res == unknown:
         print("⚠️ Timeout or resource limit hit:", s.reason_unknown())
@@ -131,11 +152,25 @@ if __name__ == "__main__":
     start = time.time()
     partition = build_static_partition([])
     print("Generated {} cubes in {:.2f}s\n".format(len(partition), time.time() - start))
+    
     # for cube in partition:
     #     print("Solving cube", cube)
-    #     solve_cube(cube)
-    # with ProcessPoolExecutor() as executor: # CRASHES DUE TO PICKLING ISSUE OF Z3 OBJECTS
-    #     results = list(executor.map(solve_cube, partition))
-    # for i, r in enumerate(results):
-    #     print(f"Cube {i+1}: {r}")
+    #     solve_cube_synchronous(cube)
+    # sys.exit(0)
+
+    # need to reassign contexts sequentially, parallel access to current context or its objects will result in segfault
+    # see: https://github.com/Z3Prover/z3/pull/1631/files/e32dfad81e7fc14816c034d1a527975d0cc97138
+    tasks = []
+    for cube in partition:
+        ctx = Context()
+        cube_with_ctx = map(lambda f: f.translate(ctx), cube)
+        # for cube_lit in cube_with_ctx:
+        #     assert cube_lit.ctx == ctx
+        #     assert cube_lit.ctx != main_ctx()
+        tasks.append((cube_with_ctx, ctx))
+    
+    with ThreadPoolExecutor() as executor:
+        results = list(executor.map(solve_cube_parallel, tasks))
+    for i, r in enumerate(results):
+        print(f"Cube {i+1}: {r}")
 
