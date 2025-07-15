@@ -62,7 +62,9 @@ def build_static_partition(starting_cube, cube_size=partition_depth):
     to_split = [starting_cube]
     split_lits = set()
     result = []
- 
+    sampling_timeout = 30 # seconds
+    
+    sampling_start = time.time()
     while to_split:
         # sample num_samples cubes from the current layer
         if len(to_split) <= num_samples:
@@ -92,8 +94,12 @@ def build_static_partition(starting_cube, cube_size=partition_depth):
             atom_scores.pop(v, None)
  
         if not atom_scores:
-            print("No more atoms to split on, stopping at depth {}.".format(len(to_split[0])))
-            return to_split
+            elapsed = time.time() - sampling_start
+            if elapsed < sampling_timeout:
+                continue  # Retry if we still have time
+            else:
+                print(f"⏱️Could not find new atoms to split on within {sampling_timeout} seconds, stopping at depth {len(to_split[0])}.")
+                return to_split
  
         # Select best atom to split on
         split_lit = max(atom_scores, key=atom_scores.get)
@@ -152,7 +158,7 @@ if __name__ == "__main__":
     start = time.time()
     partition = build_static_partition([])
     print("Generated {} cubes in {:.2f}s\n".format(len(partition), time.time() - start))
-    
+
     # for cube in partition:
     #     print("Solving cube", cube)
     #     solve_cube_synchronous(cube)
@@ -163,10 +169,10 @@ if __name__ == "__main__":
     tasks = []
     for cube in partition:
         ctx = Context()
-        cube_with_ctx = map(lambda f: f.translate(ctx), cube)
-        # for cube_lit in cube_with_ctx:
-        #     assert cube_lit.ctx == ctx
-        #     assert cube_lit.ctx != main_ctx()
+        cube_with_ctx = map(lambda f: f.translate(ctx), cube) # problem: too many contexts. solution: have a small pool of contexts, and 
+        for cube_lit in cube_with_ctx:
+            assert cube_lit.ctx == ctx
+            assert cube_lit.ctx != main_ctx()
         tasks.append((cube_with_ctx, ctx))
     
     with ThreadPoolExecutor() as executor:
@@ -174,3 +180,18 @@ if __name__ == "__main__":
     for i, r in enumerate(results):
         print(f"Cube {i+1}: {r}")
 
+# make sure to process cubes that are closer together in the tree, in the same solving batch, since they share mostly common prefixes and the solver can use locality optimizations
+
+
+# take a lock, translate the context inside the lock, and you're done
+
+# have a finite pool of contexts and solvers corresp to number of threads available. lock this list.
+# so we just have to pick a 
+
+
+# max threads (i.e. contexts happening at once) is num processes I have * 2
+
+
+# also, need to measure STABILITY: same/very similar times across runs 
+# http://mtzguido.tplinkdns.com:8081/z3/compare_stats.html pick some examples that are unstable (i.e. different seeds give drastically different runtimes) and then run the same thing with the new cubing (try to get as shallow as possible, experiment with it) and see if it's stable across runs on the same partition depth
+# up to me if i want to solve the cubing with multiprocess
