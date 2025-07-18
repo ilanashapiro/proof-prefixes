@@ -2,6 +2,7 @@ from z3 import *
 import itertools
 import time
 import random
+import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from collections import defaultdict
 
@@ -9,25 +10,40 @@ base_file = "hard_140_QF_UNIA.smt2"
 # base_file = "toy.smt2"
 
 # num variables, d, to use in static partition, generates 2^d cubes
-partition_depth = 3
+partition_depth = 8
 
 # clause collection globals
 rounds = 0
 cutoff = 1000
 num_samples = 32
 
-def collect_proof_prefix_stats(file_name, assumptions=[]):
-    s = SimpleSolver()
-    s.set(relevancy=0)
-    s.set("smt.case_split", 0)
-    s.set("smt.max_conflicts", 10000)
-    s.from_file(file_name)
- 
+class SolverPool:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.solver_pool = set()
+
+    def get_solver(self, cube):
+        with self.lock:
+            if len(self.solver_pool) == 0:
+                ctx = Context()
+                s = SimpleSolver(ctx)
+                s.from_file(base_file)
+                cube_with_ctx = map(lambda f: f.translate(ctx), cube)
+                return (s, cube_with_ctx)
+            else:
+                s = self.solver_pool.pop()
+                cube_with_ctx = map(lambda f: f.translate(s.ctx), cube)
+                return (s, cube_with_ctx)
+
+    def put_solver(self, solver):
+        with self.lock:
+            self.solver_pool.add(solver)
+
+SOLVER_POOL = SolverPool()
+
+def collect_proof_prefix_stats(s, assumptions=[]):
     pos_atoms = defaultdict(float)
     neg_atoms = defaultdict(float)
- 
-    for a in assumptions:
-        s.add(a)
  
     rounds = 0
     def on_clause(p, deps, clause):
@@ -51,9 +67,8 @@ def collect_proof_prefix_stats(file_name, assumptions=[]):
             s.interrupt()
  
     OnClause(s, on_clause)
-    res = s.check()
-    # print(res == unsat)
- 
+    res = s.check(assumptions)
+
     return pos_atoms, neg_atoms, res
 
 # From paper: https://www.cs.cmu.edu/~mheule/publications/proofix-SAT25.pdf (background: https://www.cs.utexas.edu/%7Emarijn/publications/cube.pdf)
@@ -63,6 +78,12 @@ def build_static_partition(starting_cube, cube_size=partition_depth):
     split_lits = set()
     result = []
     sampling_timeout = 30 # seconds
+
+    s = SimpleSolver()
+    s.set(relevancy=0)
+    s.set("smt.case_split", 0)
+    s.set("smt.max_conflicts", 10000)
+    s.from_file(base_file)
     
     sampling_start = time.time()
     while to_split:
@@ -71,15 +92,15 @@ def build_static_partition(starting_cube, cube_size=partition_depth):
             sampled_cubes = to_split
         else:
             sampled_cubes = random.sample(to_split, num_samples)
-        # Collect stats for each sampled cube
+        
         atom_scores = defaultdict(int)
         for cube in sampled_cubes:
             assumptions = cube
-            pos_atoms, neg_atoms, partial_run_result = collect_proof_prefix_stats(base_file, assumptions)
+            pos_atoms, neg_atoms, partial_run_result = collect_proof_prefix_stats(s, assumptions)
             if partial_run_result == unsat:
                 # print("Cube is unsat, skipping:", cube)
                 continue
-            # print(pos_atoms, neg_atoms)
+            
             for v in pos_atoms:
                 if v in neg_atoms: # give preference to atoms that appear in both polarities
                     atom_scores[v] = 100*pos_atoms[v]*neg_atoms[v]
@@ -119,40 +140,38 @@ def build_static_partition(starting_cube, cube_size=partition_depth):
  
     return result
 
-def solve_cube_parallel(params):
-    cube, ctx = params
-    for cube_lit in cube:
-        assert cube_lit.ctx == ctx
-        assert cube_lit.ctx != main_ctx()
+def solve_cube_parallel(cube):
+    s, cube_with_ctx = SOLVER_POOL.get_solver(cube)
 
-    s = SimpleSolver(ctx)
-    s.from_file(base_file)
-    s.add(*cube)
-    
     timeout_secs = 10
     s.set("timeout", timeout_secs * 1000)  # Z3 timeout in milliseconds
     set_param("verbose", 0)
     
-    res = s.check()
+    res = s.check(cube_with_ctx) # add cube as list of assumptions
     if res == unknown:
         print("⚠️ Timeout or resource limit hit:", s.reason_unknown())
     else:
         print("✅ Result:", res)
+
+    SOLVER_POOL.put_solver(s)
+    s = None  # Clear the solver to free resources. do i need this???
+
+    return res
 
 def solve_cube_synchronous(cube):
     s = SimpleSolver()
     s.from_file(base_file)
-    s.add(*cube)
     
     timeout_secs = 10
     s.set("timeout", timeout_secs * 1000)  # Z3 timeout in milliseconds
     set_param("verbose", 0)
     
-    res = s.check()
+    res = s.check(cube) # add cube as list of assumptions
     if res == unknown:
         print("⚠️ Timeout or resource limit hit:", s.reason_unknown())
     else:
         print("✅ Result:", res)
+    return res
 
 if __name__ == "__main__":
     start = time.time()
@@ -166,22 +185,13 @@ if __name__ == "__main__":
 
     # need to reassign contexts sequentially, parallel access to current context or its objects will result in segfault
     # see: https://github.com/Z3Prover/z3/pull/1631/files/e32dfad81e7fc14816c034d1a527975d0cc97138
-    tasks = []
-    for cube in partition:
-        ctx = Context()
-        cube_with_ctx = map(lambda f: f.translate(ctx), cube) # problem: too many contexts. solution: have a small pool of contexts, and 
-        for cube_lit in cube_with_ctx:
-            assert cube_lit.ctx == ctx
-            assert cube_lit.ctx != main_ctx()
-        tasks.append((cube_with_ctx, ctx))
-    
+
     with ThreadPoolExecutor() as executor:
-        results = list(executor.map(solve_cube_parallel, tasks))
+        results = list(executor.map(solve_cube_parallel, partition))
     for i, r in enumerate(results):
         print(f"Cube {i+1}: {r}")
 
 # make sure to process cubes that are closer together in the tree, in the same solving batch, since they share mostly common prefixes and the solver can use locality optimizations
-
 
 # take a lock, translate the context inside the lock, and you're done
 
