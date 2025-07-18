@@ -6,40 +6,52 @@ import threading
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from collections import defaultdict
 
-base_file = "hard_140_QF_UNIA.smt2"
-# base_file = "toy.smt2"
+BASE_FILE = "hard_140_QF_UNIA.smt2"
+# BASE_FILE = "toy.smt2"
 
 # num variables, d, to use in static partition, generates 2^d cubes
-partition_depth = 8
+PARTITION_DEPTH = 4
 
 # clause collection globals
-rounds = 0
-cutoff = 1000
-num_samples = 32
+ROUNDS = 0
+CUTOFF = 1000
+NUM_SAMPLES = 32
 
-class SolverPool:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.solver_pool = set()
+# Shared queue of cubes to be protected by a lock
+CUBE_QUEUE = []
+CUBE_QUEUE_LOCK = threading.Lock()
+BATCH_SIZE = 4  # You can tune this based on experiments
+NUM_WORKERS = os.cpu_count() or 4  # Use number of logical CPUs
 
-    def get_solver(self, cube):
-        with self.lock:
-            if len(self.solver_pool) == 0:
-                ctx = Context()
-                s = SimpleSolver(ctx)
-                s.from_file(base_file)
-                cube_with_ctx = map(lambda f: f.translate(ctx), cube)
-                return (s, cube_with_ctx)
+def get_next_batch():
+    with CUBE_QUEUE_LOCK:
+        if not CUBE_QUEUE:
+            return None
+        batch = CUBE_QUEUE[:BATCH_SIZE]
+        del CUBE_QUEUE[:BATCH_SIZE]
+        return batch
+
+def solver_thread():
+    ctx = Context()
+    s = SimpleSolver(ctx)
+    s.from_file(BASE_FILE)
+    timeout_secs = 10
+    s.set("timeout", timeout_secs * 1000)
+    set_param("verbose", 0)
+
+    while True:
+        batch = get_next_batch()
+        if batch is None:
+            break
+        for cube in batch:
+            cube_with_ctx = [lit.translate(ctx) for lit in cube]
+            s.push()
+            res = s.check(cube_with_ctx)
+            if res == unknown:
+                print("⚠️ Timeout or resource limit hit:", s.reason_unknown())
             else:
-                s = self.solver_pool.pop()
-                cube_with_ctx = map(lambda f: f.translate(s.ctx), cube)
-                return (s, cube_with_ctx)
-
-    def put_solver(self, solver):
-        with self.lock:
-            self.solver_pool.add(solver)
-
-SOLVER_POOL = SolverPool()
+                print("✅ Result:", res)
+            s.pop()
 
 def collect_proof_prefix_stats(s, assumptions=[]):
     pos_atoms = defaultdict(float)
@@ -63,7 +75,7 @@ def collect_proof_prefix_stats(s, assumptions=[]):
                 neg_atoms[lit] += weight
             else:
                 pos_atoms[lit] += weight
-        if rounds >= cutoff:
+        if rounds >= CUTOFF:
             s.interrupt()
  
     OnClause(s, on_clause)
@@ -73,7 +85,7 @@ def collect_proof_prefix_stats(s, assumptions=[]):
 
 # From paper: https://www.cs.cmu.edu/~mheule/publications/proofix-SAT25.pdf (background: https://www.cs.utexas.edu/%7Emarijn/publications/cube.pdf)
 # Reference: https://github.com/zaxioms0/proofix/blob/main/drat_lit_count.py
-def build_static_partition(starting_cube, cube_size=partition_depth):
+def build_static_partition(starting_cube, cube_size=PARTITION_DEPTH):
     to_split = [starting_cube]
     split_lits = set()
     result = []
@@ -83,16 +95,16 @@ def build_static_partition(starting_cube, cube_size=partition_depth):
     s.set(relevancy=0)
     s.set("smt.case_split", 0)
     s.set("smt.max_conflicts", 10000)
-    s.from_file(base_file)
-    
+    s.from_file(BASE_FILE)
+
     sampling_start = time.time()
     while to_split:
-        # sample num_samples cubes from the current layer
-        if len(to_split) <= num_samples:
+        # sample NUM_SAMPLES cubes from the current layer
+        if len(to_split) <= NUM_SAMPLES:
             sampled_cubes = to_split
         else:
-            sampled_cubes = random.sample(to_split, num_samples)
-        
+            sampled_cubes = random.sample(to_split, NUM_SAMPLES)
+
         atom_scores = defaultdict(int)
         for cube in sampled_cubes:
             assumptions = cube
@@ -140,28 +152,10 @@ def build_static_partition(starting_cube, cube_size=partition_depth):
  
     return result
 
-def solve_cube_parallel(cube):
-    s, cube_with_ctx = SOLVER_POOL.get_solver(cube)
-
-    timeout_secs = 10
-    s.set("timeout", timeout_secs * 1000)  # Z3 timeout in milliseconds
-    set_param("verbose", 0)
-    
-    res = s.check(cube_with_ctx) # add cube as list of assumptions
-    if res == unknown:
-        print("⚠️ Timeout or resource limit hit:", s.reason_unknown())
-    else:
-        print("✅ Result:", res)
-
-    SOLVER_POOL.put_solver(s)
-    s = None  # Clear the solver to free resources. do i need this???
-
-    return res
-
 def solve_cube_synchronous(cube):
     s = SimpleSolver()
-    s.from_file(base_file)
-    
+    s.from_file(BASE_FILE)
+
     timeout_secs = 10
     s.set("timeout", timeout_secs * 1000)  # Z3 timeout in milliseconds
     set_param("verbose", 0)
@@ -176,6 +170,7 @@ def solve_cube_synchronous(cube):
 if __name__ == "__main__":
     start = time.time()
     partition = build_static_partition([])
+    CUBE_QUEUE.extend(partition)
     print("Generated {} cubes in {:.2f}s\n".format(len(partition), time.time() - start))
 
     # for cube in partition:
@@ -186,18 +181,10 @@ if __name__ == "__main__":
     # need to reassign contexts sequentially, parallel access to current context or its objects will result in segfault
     # see: https://github.com/Z3Prover/z3/pull/1631/files/e32dfad81e7fc14816c034d1a527975d0cc97138
 
-    with ThreadPoolExecutor() as executor:
-        results = list(executor.map(solve_cube_parallel, partition))
-    for i, r in enumerate(results):
-        print(f"Cube {i+1}: {r}")
-
-# make sure to process cubes that are closer together in the tree, in the same solving batch, since they share mostly common prefixes and the solver can use locality optimizations
-
-# take a lock, translate the context inside the lock, and you're done
-
-# have a finite pool of contexts and solvers corresp to number of threads available. lock this list.
-# so we just have to pick a 
-
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = [executor.submit(solver_thread) for _ in range(NUM_WORKERS)]
+    for future in futures:
+        future.result()  # Raise any exceptions that occurred
 
 # max threads (i.e. contexts happening at once) is num processes I have * 2
 
